@@ -1,0 +1,11 @@
+.env
+venv/
+__pycache__/
+*.pyc
+db.sqlite3
+*.log
+.vscode/
+.idea/
+.env
+# Invoice archive ZIPs (VAT_ARCHIVE_DIR)
+private/

@@ -1,0 +1,299 @@
+from decimal import Decimal
+
+from rest_framework import serializers
+
+from common.validators import reject_branch_mismatch, require_bilingual_pair
+from inventory.services import check_product_stock
+from kitchen.models import KitchenStation
+from kitchen.serializers import validate_station_branch
+
+from .models import Category, Deal, DealWindow, Product, ProductVariant, Weekday
+
+
+def _station_ref(station):
+    return {"id": station.pk, "name_en": station.name_en, "name_ar": station.name_ar, "is_active": station.is_active}
+
+
+def effective_station(product):
+    """
+    Where this dish's lines go when fired, and why — shown on the menu and
+    product form so nobody has to work out the category fallback in their head.
+    `source` is "product" (set on the dish), "category" (the category's
+    default) or "general" (neither, or the station is switched off).
+    Mirrors kitchen.routing.stations_for_products.
+    """
+    if product.station_id and product.station.is_active:
+        return {"source": "product", "station": _station_ref(product.station)}
+    category_station = product.category.station if product.category_id else None
+    if category_station is not None and category_station.is_active:
+        return {"source": "category", "station": _station_ref(category_station)}
+    return {"source": "general", "station": None}
+
+
+class CategorySerializer(serializers.ModelSerializer):
+    product_count = serializers.IntegerField(read_only=True, default=0)
+    station = serializers.PrimaryKeyRelatedField(
+        queryset=KitchenStation.objects.all(), allow_null=True, required=False,
+        error_messages={"does_not_exist": "error.stationNotFound"},
+    )
+    # Neither language is unconditionally required — see require_bilingual_pair
+    # below, which only requires whichever one the admin UI has active.
+    name_en = serializers.CharField(required=False, allow_blank=True)
+    name_ar = serializers.CharField(required=False, allow_blank=True)
+
+    class Meta:
+        model = Category
+        fields = ["id", "branch", "name_en", "name_ar", "sort_order", "station", "created_at", "updated_at", "product_count"]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def validate_station(self, value):
+        return validate_station_branch(value, self.context.get("request"))
+
+    def validate(self, attrs):
+        branch = attrs.get("branch", getattr(self.instance, "branch", None))
+        reject_branch_mismatch(self.context.get("request"), branch)
+        require_bilingual_pair(attrs, self.instance, "name")
+
+        name_en = attrs.get("name_en", getattr(self.instance, "name_en", None))
+        if name_en:
+            qs = Category.objects.filter(branch=branch, name_en__iexact=name_en.strip())
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({"name_en": "error.duplicateName"})
+        return attrs
+
+
+class DealWindowSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DealWindow
+        fields = ["day", "start_time", "end_time"]
+
+
+class DealSerializer(serializers.ModelSerializer):
+    windows = DealWindowSerializer(many=True)
+
+    class Meta:
+        model = Deal
+        fields = ["price", "windows"]
+
+    def validate(self, attrs):
+        product = self.context["product"]
+        if attrs["price"] >= product.price:
+            raise serializers.ValidationError({"price": "error.dealPriceTooHigh"})
+
+        windows = attrs.get("windows") or []
+        if not windows:
+            raise serializers.ValidationError({"windows": "error.dealWindowsRequired"})
+        for window in windows:
+            if window["start_time"] >= window["end_time"]:
+                raise serializers.ValidationError({"windows": "error.dealWindowInvalid"})
+        return attrs
+
+    def create(self, validated_data):
+        windows_data = validated_data.pop("windows")
+        product = self.context["product"]
+        deal, _ = Deal.objects.update_or_create(product=product, defaults=validated_data)
+        deal.windows.all().delete()
+        DealWindow.objects.bulk_create([DealWindow(deal=deal, **window) for window in windows_data])
+        return deal
+
+
+
+class ProductVariantSerializer(serializers.ModelSerializer):
+    """
+    One configurable portion of a product. The restaurant supplies the name and
+    price; nothing here assumes what a variant represents.
+
+    `costing` is DERIVED live from current ingredient prices — see
+    catalog/costing.py. It is staff-only data and is never exposed on the
+    public menu.
+    """
+
+    name_en = serializers.CharField(required=False, allow_blank=True)
+    name_ar = serializers.CharField(required=False, allow_blank=True)
+    price = serializers.DecimalField(
+        max_digits=10, decimal_places=2, min_value=0,
+        error_messages={"min_value": "error.priceInvalid", "required": "error.priceInvalid", "invalid": "error.priceInvalid"},
+    )
+    recipe_multiplier = serializers.DecimalField(
+        max_digits=6, decimal_places=3, min_value=Decimal("0.001"), max_value=Decimal("999"), required=False,
+        error_messages={
+            "min_value": "error.recipeMultiplierInvalid",
+            "max_value": "error.recipeMultiplierInvalid",
+            "invalid": "error.recipeMultiplierInvalid",
+        },
+    )
+    costing = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProductVariant
+        fields = [
+            "id", "product", "name_en", "name_ar", "price", "recipe_multiplier",
+            "is_active", "sort_order", "costing", "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "product", "costing", "created_at", "updated_at"]
+
+    def get_costing(self, variant):
+        from .costing import costing as compute_costing
+        return compute_costing(variant.product, variant)
+
+    def _target_product(self):
+        """
+        The product this variant belongs to.
+
+        On update it comes from the instance; on create it comes from the URL
+        (/api/products/<product_pk>/variants/), which is why `product` is
+        read-only above — a nested resource must not let the body point the
+        variant at a different product than the URL says.
+        """
+        if self.instance is not None:
+            return self.instance.product
+        product_pk = (self.context.get("view").kwargs.get("product_pk")
+                      if self.context.get("view") else None)
+        if not product_pk:
+            return None
+        return Product.objects.filter(pk=product_pk).select_related("branch").first()
+
+    def validate(self, attrs):
+        require_bilingual_pair(attrs, self.instance, "name")
+
+        product = self._target_product()
+        if product is not None:
+            reject_branch_mismatch(self.context.get("request"), product.branch)
+
+        # Two "1 KG" rows on the same product would make the menu ambiguous and
+        # the order snapshot meaningless. Mirrors the name_en-only uniqueness
+        # convention used for categories, products and tables.
+        name_en = attrs.get("name_en", getattr(self.instance, "name_en", None))
+        if name_en and product is not None:
+            duplicates = ProductVariant.objects.filter(
+                product=product, name_en__iexact=name_en.strip(),
+            )
+            if self.instance:
+                duplicates = duplicates.exclude(pk=self.instance.pk)
+            if duplicates.exists():
+                raise serializers.ValidationError({"name_en": "error.variantNameExists"})
+        return attrs
+
+
+class ProductSerializer(serializers.ModelSerializer):
+    recipe_count = serializers.IntegerField(read_only=True, default=0)
+    # Neither language is unconditionally required — see require_bilingual_pair
+    # in validate(), which only requires whichever one the admin UI has active.
+    name_en = serializers.CharField(required=False, allow_blank=True)
+    name_ar = serializers.CharField(required=False, allow_blank=True)
+    price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=0,
+        error_messages={"min_value": "error.priceInvalid", "required": "error.priceInvalid", "invalid": "error.priceInvalid"},
+    )
+    cost_price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=0,
+        # Optional: when a product has a recipe, its cost is DERIVED from the
+        # ingredients (see costing.recipe_cost) and the admin should not have
+        # to keep a second copy in sync by hand. Still writable for bought-in
+        # goods — a canned drink has a real cost and no recipe.
+        required=False,
+        error_messages={"min_value": "error.costPriceInvalid", "invalid": "error.costPriceInvalid"},
+    )
+    category = serializers.PrimaryKeyRelatedField(
+        queryset=Category.objects.all(),
+        error_messages={"required": "error.categoryRequired", "does_not_exist": "error.categoryRequired"},
+    )
+    # The dish's own station; null follows the category. `effective_station`
+    # is where its lines actually go.
+    station = serializers.PrimaryKeyRelatedField(
+        queryset=KitchenStation.objects.all(), allow_null=True, required=False,
+        error_messages={"does_not_exist": "error.stationNotFound"},
+    )
+    effective_station = serializers.SerializerMethodField()
+    deal = DealSerializer(read_only=True)
+    is_orderable = serializers.SerializerMethodField()
+    # Whole units current stock can make (base recipe), so a POS can disable
+    # "+"/"Add" at the limit. Set by the list view; None elsewhere.
+    available_quantity = serializers.SerializerMethodField()
+    variants = ProductVariantSerializer(many=True, read_only=True)
+    # Live margin figures, recomputed from current InventoryItem.cost_per_unit
+    # on every read. Never stored, so a new purchase moves these immediately.
+    costing = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = [
+            "recipe_count",
+            "id", "branch", "category", "name_en", "name_ar",
+            "description_en", "description_ar", "price", "cost_price",
+            "image", "is_available", "is_orderable", "available_quantity", "badge", "days", "deal",
+            "variants", "costing", "station", "effective_station",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "variants", "costing", "effective_station", "created_at", "updated_at"]
+
+    def validate_station(self, value):
+        return validate_station_branch(value, self.context.get("request"))
+
+    def get_effective_station(self, product):
+        return effective_station(product)
+
+    def validate_days(self, value):
+        valid_days = {choice for choice, _ in Weekday.choices}
+        if not isinstance(value, list) or not all(day in valid_days for day in value):
+            raise serializers.ValidationError("error.invalidWeekday")
+        return value
+
+    def get_costing(self, product):
+        from .costing import costing as compute_costing
+        return compute_costing(product)
+
+    def _recipe_cost_or_none(self, product):
+        """The product's ingredient cost, or None when it has no recipe."""
+        from .costing import recipe_cost
+        if product is None or not product.recipe_items.exists():
+            return None
+        return recipe_cost(product)
+
+    def create(self, validated_data):
+        # A new product has no recipe yet, so there is nothing to derive from;
+        # default to 0 rather than rejecting the form over a field the user
+        # should not have to think about.
+        validated_data.setdefault("cost_price", 0)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Not supplied -> keep it in step with the recipe automatically.
+        if "cost_price" not in validated_data:
+            derived = self._recipe_cost_or_none(instance)
+            if derived is not None:
+                validated_data["cost_price"] = derived
+        return super().update(instance, validated_data)
+
+    def get_available_quantity(self, product):
+        return getattr(product, "_available_quantity", None)
+
+    def get_is_orderable(self, product):
+        if hasattr(product, "_is_orderable"):
+            return product._is_orderable
+        from .services import is_available_today
+
+        if not is_available_today(product):
+            return False
+        available, _reason = check_product_stock(product)
+        return available
+
+    def validate(self, attrs):
+        branch = attrs.get("branch", getattr(self.instance, "branch", None))
+        reject_branch_mismatch(self.context.get("request"), branch)
+        require_bilingual_pair(attrs, self.instance, "name")
+
+        name_en = attrs.get("name_en", getattr(self.instance, "name_en", None))
+        if name_en:
+            qs = Product.objects.filter(branch=branch, name_en__iexact=name_en.strip())
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({"name_en": "error.duplicateName"})
+        return attrs
